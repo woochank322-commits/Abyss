@@ -339,12 +339,9 @@ def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
     hour_pattern = (
         r"(?:\d{1,2}|열두|열한|열|십이|십일|십|한|두|세|네|다섯|여섯|일곱|여덟|아홉|일|이|삼|사|오|육|칠|팔|구)"
     )
+    ones_pattern = r"(?:일|이|삼|사|오|육|칠|팔|구|한|두|세|네|다섯|여섯|일곱|여덟|아홉)"
     minute_pattern = (
-        r"(?:\d{1,2}|이십[일-구한-아홉]?|스물[일-구한-아홉]?|"
-        r"삼십[일-구한-아홉]?|서른[일-구한-아홉]?|"
-        r"사십[일-구한-아홉]?|마흔[일-구한-아홉]?|"
-        r"오십[일-구한-아홉]?|쉰[일-구한-아홉]?|"
-        r"십[일-구한-아홉]?|일|이|삼|사|오|육|칠|팔|구|반)"
+        rf"(?:\d{{1,2}}|(?:이십|스물|삼십|서른|사십|마흔|오십|쉰|십){ones_pattern}?|{ones_pattern}|반)"
     )
 
     hour_matches = re.findall(rf"({hour_pattern})시", compact)
@@ -493,6 +490,11 @@ def handle_audio_message(event):
         bool(profile),
     )
 
+    if not profile:
+        logger.info("[VOICE] missing profile user_id=%s", user_id)
+        reply_messages(event.reply_token, [MSG_1])
+        return
+
     try:
         audio_bytes = download_line_audio(event.message.id)
         logger.info("[VOICE] downloaded bytes=%d user_id=%s", len(audio_bytes), user_id)
@@ -502,11 +504,6 @@ def handle_audio_message(event):
     except Exception:
         logger.exception("[VOICE] audio processing error user_id=%s", user_id)
         reply_messages(event.reply_token, [MSG_4])
-        return
-
-    if not profile:
-        logger.info("[VOICE] missing profile user_id=%s transcript=%r", user_id, transcript)
-        reply_messages(event.reply_token, [MSG_1])
         return
 
     expected_nick = profile["nickname"]
@@ -556,14 +553,4 @@ def handle_message(event):
         reply_messages(event.reply_token, [MSG_2])
         return
 
-    parts = [p for p in re.split(r"[\s/]+", user_text) if p]
-    if len(parts) == 3:
-        nick, gender, raw_year = parts
-        year2 = normalize_year2(raw_year)
-        if is_valid_hangul_two_chars(nick) and gender in GENDER_EMOJI_MAP and year2:
-            reply_messages(event.reply_token, [build_nickname(nick, gender, year2)])
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    parts = [p for p in re.split(r"[\s/]+", user_text) if p
