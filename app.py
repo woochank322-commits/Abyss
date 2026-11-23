@@ -270,7 +270,8 @@ def transcribe_korean_speech(wav_path: str) -> str | None:
         return None
 
 
-def korean_number_to_int(word: str) -> int | None:
+def korean_number_to_int(word: str, is_hour: bool = False) -> int | None:
+    """아라비아 숫자 및 한자/고유어/구어체 수사('열한', '스물다섯', '이십오', '반')를 정수로 변환"""
     word = word.strip()
     if not word:
         return None
@@ -279,23 +280,35 @@ def korean_number_to_int(word: str) -> int | None:
     if word == "반":
         return 30
 
-    hour_map = {
-        "한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6,
-        "일곱": 7, "여덟": 8, "아홉": 9, "열": 10, "열한": 11, "열두": 12,
-        "일": 1, "이": 2, "삼": 3, "사": 4, "오": 5, "육": 6,
-        "칠": 7, "팔": 8, "구": 9, "십": 10, "십일": 11, "십이": 12,
-    }
-    if word in hour_map:
-        return hour_map[word]
+    if is_hour:
+        hour_map = {
+            "열두": 12, "열한": 11, "열": 10,
+            "한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5,
+            "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9,
+            "십이": 12, "십일": 11, "십": 10,
+            "일": 1, "이": 2, "삼": 3, "사": 4, "오": 5,
+            "육": 6, "칠": 7, "팔": 8, "구": 9,
+        }
+        if word in hour_map:
+            return hour_map[word]
 
-    tens_map = {"": 0, "십": 10, "이십": 20, "삼십": 30, "사십": 40, "오십": 50}
+    tens_map = {
+        "십": 10,
+        "이십": 20, "스물": 20,
+        "삼십": 30, "서른": 30,
+        "사십": 40, "마흔": 40,
+        "오십": 50, "쉰": 50,
+    }
     ones_map = {
-        "": 0, "일": 1, "이": 2, "삼": 3, "사": 4,
-        "오": 5, "육": 6, "칠": 7, "팔": 8, "구": 9,
+        "": 0,
+        "일": 1, "이": 2, "삼": 3, "사": 4, "오": 5,
+        "육": 6, "칠": 7, "팔": 8, "구": 9,
+        "한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5,
+        "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9,
     }
 
     for tens_str, tens_val in tens_map.items():
-        if tens_str and word.startswith(tens_str):
+        if word.startswith(tens_str):
             rem = word[len(tens_str) :]
             if rem in ones_map:
                 return tens_val + ones_map[rem]
@@ -307,6 +320,7 @@ def korean_number_to_int(word: str) -> int | None:
 
 
 def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
+    """음성 인식 텍스트에서 발화된 (시_24h_후보들, 분) 목록을 추출"""
     compact = re.sub(r"\s+", "", text)
     if not compact:
         return []
@@ -314,21 +328,30 @@ def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
     is_pm = "오후" in compact or "저녁" in compact or "밤" in compact
     is_am = "오전" in compact or "아침" in compact or "새벽" in compact
 
-    hour_matches = re.findall(
-        r"(\d{1,2}|열한|열두|다섯|여섯|일곱|여덟|아홉|열|한|두|세|네|십일|십이|십|일|이|삼|사|오|육|칠|팔|구)\s*시",
-        compact,
+    hour_pattern = (
+        r"(?:\d{1,2}|열두|열한|열|십이|십일|십|한|두|세|네|다섯|여섯|일곱|여덟|아홉|일|이|삼|사|오|육|칠|팔|구)"
     )
-    minute_matches = re.findall(
-        r"(\d{1,2}|이십|삼십|사십|오십|십|일|이|삼|사|오|육|칠|팔|구|반)\s*분",
-        compact,
+    minute_pattern = (
+        r"(?:\d{1,2}|이십[일-구한-아홉]?|스물[일-구한-아홉]?|"
+        r"삼십[일-구한-아홉]?|서른[일-구한-아홉]?|"
+        r"사십[일-구한-아홉]?|마흔[일-구한-아홉]?|"
+        r"오십[일-구한-아홉]?|쉰[일-구한-아홉]?|"
+        r"십[일-구한-아홉]?|일|이|삼|사|오|육|칠|팔|구|반)"
     )
 
-    if not hour_matches:
+    hour_matches = re.findall(rf"({hour_pattern})시", compact)
+    minute_matches = re.findall(rf"({minute_pattern})분", compact)
+
+    # '1시 반'처럼 '분' 없이 '시 + 반'으로만 말한 경우도 분=30 후보로 인식
+    if not minute_matches and re.search(rf"{hour_pattern}시반", compact):
+        minute_matches = ["반"]
+
+    if not hour_matches or not minute_matches:
         return []
 
     hours_24_candidates = set()
     for h_raw in hour_matches:
-        h_val = korean_number_to_int(h_raw)
+        h_val = korean_number_to_int(h_raw, is_hour=True)
         if h_val is None:
             continue
         if is_pm and 1 <= h_val <= 11:
@@ -342,7 +365,7 @@ def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
 
     minutes = []
     for m_raw in minute_matches:
-        m_val = korean_number_to_int(m_raw)
+        m_val = korean_number_to_int(m_raw, is_hour=False)
         if m_val is not None and 0 <= m_val <= 59:
             minutes.append(m_val)
 
@@ -472,12 +495,14 @@ def handle_audio_message(event):
         return
 
     expected_nick = profile["nickname"]
+    spoken_pairs = extract_spoken_hour_minute(transcript or "")
     script_ok = verify_spoken_script(transcript, expected_nick, now_kst)
 
     logger.info(
-        "[VOICE] user_id=%s kst=%s script_ok=%s transcript=%r profile=%s",
+        "[VOICE] user_id=%s kst=%s parsed_pairs=%s script_ok=%s transcript=%r profile=%s",
         user_id,
         now_kst.strftime("%Y-%m-%d %H:%M:%S"),
+        spoken_pairs,
         script_ok,
         transcript,
         profile,
