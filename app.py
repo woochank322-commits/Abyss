@@ -117,38 +117,47 @@ def build_nickname(nickname: str, gender: str, year2: str) -> str:
 
 
 def parse_step1_form(text: str) -> dict | None:
-    """/1 양식이 작성되었는지 검증하고 년생/성별/닉네임을 추출"""
+    """1단계 양식이 작성되었는지 검증하고 년생/성별/닉네임을 추출"""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    info_line = next((l for l in lines if "년생" in l and ":" in l), None)
-    nick_line = next((l for l in lines if "닉네임" in l and ":" in l), None)
-    inviter_line = next((l for l in lines if "초대자" in l and ":" in l), None)
-    tendency_line = next((l for l in lines if "성향" in l and ":" in l), None)
+    info_line = next((l for l in lines if ("년생" in l or "성별" in l) and (":" in l or "-" in l)), None)
+    nick_line = next((l for l in lines if "닉네임" in l and (":" in l or "-" in l)), None)
+    inviter_line = next((l for l in lines if "초대자" in l and (":" in l or "-" in l)), None)
+    tendency_line = next((l for l in lines if "성향" in l and (":" in l or "-" in l)), None)
 
     if not all([info_line, nick_line, inviter_line, tendency_line]):
         return None
 
-    info_val = info_line.split(":", 1)[1].strip()
-    nick_val = nick_line.split(":", 1)[1].strip()
-    inviter_val = inviter_line.split(":", 1)[1].strip()
-    tendency_val = tendency_line.split(":", 1)[1].strip()
+    sep = ":" if ":" in info_line else "-"
+    info_val = info_line.split(sep, 1)[1].strip()
+
+    nick_sep = ":" if ":" in nick_line else "-"
+    nick_val = nick_line.split(nick_sep, 1)[1].strip()
+
+    inv_sep = ":" if ":" in inviter_line else "-"
+    inviter_val = inviter_line.split(inv_sep, 1)[1].strip()
+
+    ten_sep = ":" if ":" in tendency_line else "-"
+    tendency_val = tendency_line.split(ten_sep, 1)[1].strip()
 
     if not info_val or not nick_val or not inviter_val or not tendency_val:
         return None
 
-    # '09 / 서울 / 여' 또는 '2009년생, 잠실, 남' 등 구분자 유연 처리
-    tokens = [t.strip() for t in re.split(r"[/,|]+", info_val) if t.strip()]
-    if len(tokens) < 3:
-        return None
-
-    year2 = normalize_year2(tokens[0])
-    gender_token = tokens[2]
-
+    tokens = [t.strip() for t in re.split(r"[/,|\s]+", info_val) if t.strip()]
+    year2 = None
     gender = None
-    if "여" in gender_token and "남" not in gender_token:
-        gender = "여"
-    elif "남" in gender_token and "여" not in gender_token:
-        gender = "남"
+
+    for tok in tokens:
+        if not year2:
+            candidate_year = normalize_year2(tok)
+            if candidate_year:
+                year2 = candidate_year
+                continue
+        if not gender:
+            if tok == "여" or ("여" in tok and "남" not in tok and "년생" not in tok):
+                gender = "여"
+            elif tok == "남" or ("남" in tok and "여" not in tok and "년생" not in tok):
+                gender = "남"
 
     if not year2 or not gender or not is_valid_hangul_two_chars(nick_val):
         return None
@@ -188,13 +197,34 @@ def convert_m4a_to_wav_16k_mono(audio_bytes: bytes, tmpdir: str) -> str:
     return wav_path
 
 
-def estimate_gender_hz(wav_path: str) -> str | None:
+def compute_spectral_centroid(frame: np.ndarray, sample_rate: int) -> float:
+    """단일 프레임의 스펙트럼 중심(Spectral Centroid, Hz) 계산"""
+    windowed = frame * np.hanning(len(frame))
+    spectrum = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(len(windowed), d=1.0 / sample_rate)
+
+    band_mask = (freqs >= 80.0) & (freqs <= 6000.0)
+    band_mag = spectrum[band_mask]
+    band_freqs = freqs[band_mask]
+
+    total_mag = float(np.sum(band_mag))
+    if total_mag <= 1e-9:
+        return 0.0
+    return float(np.sum(band_freqs * band_mag) / total_mag)
+
+
+def analyze_voice_features(wav_path: str) -> dict:
+    """녹음 길이, 유성음 비율, 피치 중앙값(Hz), 스펙트럼 중심 중앙값(Hz) 및 성별 추정"""
     sample_rate, samples = wavfile.read(wav_path)
-    if samples.size == 0:
-        return None
+    if samples.size == 0 or sample_rate <= 0:
+        return {"ok": False}
+
+    duration_sec = float(len(samples)) / float(sample_rate)
+    if duration_sec < 1.0:
+        return {"ok": False, "reason": "short_audio"}
 
     audio = samples.astype(np.float32)
-    max_val = np.max(np.abs(audio))
+    max_val = float(np.max(np.abs(audio)))
     if max_val > 0:
         audio = audio / max_val
 
@@ -203,10 +233,16 @@ def estimate_gender_hz(wav_path: str) -> str | None:
     min_lag = max(1, int(sample_rate / 350))
     max_lag = min(frame_len - 1, int(sample_rate / 70))
 
+    total_frames = 0
+    voiced_frames = 0
     pitches = []
+    centroids = []
+
     for start in range(0, len(audio) - frame_len, hop_len):
+        total_frames += 1
         frame = audio[start : start + frame_len]
-        if np.sqrt(np.mean(frame ** 2)) < 0.03:
+        rms = float(np.sqrt(np.mean(frame ** 2)))
+        if rms < 0.03:
             continue
 
         windowed = frame * np.hanning(frame_len)
@@ -220,16 +256,44 @@ def estimate_gender_hz(wav_path: str) -> str | None:
 
         best_idx = int(np.argmax(region))
         best_lag = min_lag + best_idx
-        if (region[best_idx] / corr[0]) > 0.35 and best_lag > 0:
-            freq = sample_rate / best_lag
+        peak_ratio = float(region[best_idx] / corr[0])
+
+        if peak_ratio > 0.35 and best_lag > 0:
+            freq = float(sample_rate / best_lag)
             if 70.0 <= freq <= 350.0:
+                voiced_frames += 1
                 pitches.append(freq)
+                sc = compute_spectral_centroid(frame, sample_rate)
+                if sc > 0:
+                    centroids.append(sc)
 
-    if not pitches:
-        return None
+    voiced_ratio = (voiced_frames / total_frames) if total_frames > 0 else 0.0
+    if voiced_ratio < 0.15 or not pitches:
+        return {"ok": False, "reason": "low_voiced_ratio"}
 
-    median_hz = float(np.median(pitches))
-    return "여" if median_hz >= 165.0 else "남"
+    median_pitch = float(np.median(pitches))
+    median_centroid = float(np.median(centroids)) if centroids else 0.0
+
+    if median_pitch >= 175.0:
+        est_gender = "여"
+    elif median_pitch < 150.0:
+        est_gender = "남"
+    else:
+        if median_centroid >= 2150.0:
+            est_gender = "여"
+        elif median_centroid < 1650.0:
+            est_gender = "남"
+        else:
+            est_gender = "여" if median_pitch >= 165.0 else "남"
+
+    return {
+        "ok": True,
+        "gender": est_gender,
+        "duration_sec": round(duration_sec, 2),
+        "voiced_ratio": round(voiced_ratio * 100, 1),
+        "pitch_hz": round(median_pitch, 1),
+        "centroid_hz": round(median_centroid, 1),
+    }
 
 
 def transcribe_korean_speech(wav_path: str) -> str | None:
@@ -243,13 +307,19 @@ def transcribe_korean_speech(wav_path: str) -> str | None:
 
 
 def verify_spoken_script(transcript: str | None, expected_nickname: str | None) -> bool:
-    """현재 시간 표현(시/분)과 하실 닉네임 포함 여부 검증"""
+    """실제 현재 시각과 일치할 필요는 없으나, 임의의 시간 표현(시/분)과 닉네임을 말했는지 검증"""
     if not transcript:
         return False
 
     compact = re.sub(r"\s+", "", transcript)
-    has_time = bool(re.search(r"(\d{1,2}시|분|오전|오후)", compact))
-    if not has_time:
+    if not compact:
+        return False
+
+    time_pattern = re.compile(
+        r"(\d{1,2}시|\d{1,2}분|(한|두|세|네|다섯|여섯|일곱|여덟|아홉|열|열한|열두)시|"
+        r"(일|이|삼|사|오|십|이십|삼십|사십|오십|반)분|오전|오후)"
+    )
+    if not time_pattern.search(compact):
         return False
 
     if expected_nickname:
@@ -308,16 +378,21 @@ def handle_audio_message(event):
         audio_bytes = download_line_audio(event.message.id)
         with tempfile.TemporaryDirectory() as tmpdir:
             wav_path = convert_m4a_to_wav_16k_mono(audio_bytes, tmpdir)
-            est_gender = estimate_gender_hz(wav_path)
+            voice_info = analyze_voice_features(wav_path)
             transcript = transcribe_korean_speech(wav_path)
     except Exception:
         reply_messages(event.reply_token, [MSG_4])
         return
 
+    if not voice_info.get("ok"):
+        reply_messages(event.reply_token, [MSG_4])
+        return
+
+    est_gender = voice_info["gender"]
     expected_gender = profile["gender"] if profile else None
     expected_nick = profile["nickname"] if profile else None
 
-    gender_ok = est_gender is not None and (expected_gender is None or est_gender == expected_gender)
+    gender_ok = expected_gender is None or est_gender == expected_gender
     script_ok = verify_spoken_script(transcript, expected_nick)
 
     if gender_ok and script_ok:
@@ -334,7 +409,6 @@ def handle_message(event):
     user_text = event.message.text.strip()
     user_id = getattr(event.source, "user_id", None)
 
-    # 수동 명령어 /1, /2, /3, /4
     if user_text in MANUAL_REPLIES:
         outputs = [MANUAL_REPLIES[user_text]]
         if user_text == "/3" and user_id and user_id in user_profiles:
@@ -343,7 +417,6 @@ def handle_message(event):
         reply_messages(event.reply_token, outputs)
         return
 
-    # /1 양식 작성 후 전송 시 자동 /2 발송 및 프로필 저장
     parsed = parse_step1_form(user_text)
     if parsed:
         if user_id:
@@ -351,7 +424,6 @@ def handle_message(event):
         reply_messages(event.reply_token, [MSG_2])
         return
 
-    # 수동 닉네임 생성 보조 입력: "닉네임 성별 년생" (예: 마루 여 09 -> 마루🦭⁰⁹)
     parts = user_text.split()
     if len(parts) == 3:
         nick, gender, raw_year = parts
