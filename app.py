@@ -239,12 +239,15 @@ def convert_m4a_to_wav_16k_mono(audio_bytes: bytes, tmpdir: str) -> str:
     with open(in_path, "wb") as f:
         f.write(audio_bytes)
 
+    # 조용한 발화 인식을 위해 볼륨을 소폭 부스팅(2.5x)하여 16kHz 모노 WAV로 변환
     subprocess.run(
         [
             "ffmpeg",
             "-y",
             "-i",
             in_path,
+            "-af",
+            "volume=2.5",
             "-ac",
             "1",
             "-ar",
@@ -266,12 +269,18 @@ def transcribe_korean_speech(wav_path: str) -> str | None:
         audio_data = recognizer.record(source)
     try:
         return recognizer.recognize_google(audio_data, language="ko-KR")
-    except Exception:
+    except sr.UnknownValueError:
+        logger.warning("[STT] Google STT could not understand audio")
+        return None
+    except sr.RequestError as e:
+        logger.warning("[STT] Google STT request failed: %s", e)
+        return None
+    except Exception as e:
+        logger.warning("[STT] unexpected error: %s", e)
         return None
 
 
 def korean_number_to_int(word: str, is_hour: bool = False) -> int | None:
-    """아라비아 숫자 및 한자/고유어/구어체 수사('열한', '스물다섯', '이십오', '반')를 정수로 변환"""
     word = word.strip()
     if not word:
         return None
@@ -320,7 +329,6 @@ def korean_number_to_int(word: str, is_hour: bool = False) -> int | None:
 
 
 def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
-    """음성 인식 텍스트에서 발화된 (시_24h_후보들, 분) 목록을 추출"""
     compact = re.sub(r"\s+", "", text)
     if not compact:
         return []
@@ -342,7 +350,6 @@ def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
     hour_matches = re.findall(rf"({hour_pattern})시", compact)
     minute_matches = re.findall(rf"({minute_pattern})분", compact)
 
-    # '1시 반'처럼 '분' 없이 '시 + 반'으로만 말한 경우도 분=30 후보로 인식
     if not minute_matches and re.search(rf"{hour_pattern}시반", compact):
         minute_matches = ["반"]
 
@@ -479,19 +486,27 @@ def handle_audio_message(event):
     profile = get_user_profile(user_id)
     now_kst = datetime.now(KST)
 
-    if not profile:
-        logger.info("[VOICE] missing profile user_id=%s", user_id)
-        reply_messages(event.reply_token, [MSG_1])
-        return
+    logger.info(
+        "[VOICE] received message_id=%s user_id=%s has_profile=%s",
+        event.message.id,
+        user_id,
+        bool(profile),
+    )
 
     try:
         audio_bytes = download_line_audio(event.message.id)
+        logger.info("[VOICE] downloaded bytes=%d user_id=%s", len(audio_bytes), user_id)
         with tempfile.TemporaryDirectory() as tmpdir:
             wav_path = convert_m4a_to_wav_16k_mono(audio_bytes, tmpdir)
             transcript = transcribe_korean_speech(wav_path)
     except Exception:
         logger.exception("[VOICE] audio processing error user_id=%s", user_id)
         reply_messages(event.reply_token, [MSG_4])
+        return
+
+    if not profile:
+        logger.info("[VOICE] missing profile user_id=%s transcript=%r", user_id, transcript)
+        reply_messages(event.reply_token, [MSG_1])
         return
 
     expected_nick = profile["nickname"]
