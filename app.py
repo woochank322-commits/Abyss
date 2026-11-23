@@ -90,8 +90,14 @@ GENDER_EMOJI_MAP = {
 
 SUPERSCRIPT_MAP = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
-# 유저별 /1 입력 정보 저장: {user_id: {"year2": "09", "gender": "여", "nickname": "마루"}}
+# 유저별 임시 인증 정보 저장: {user_id: {"year2": "09", "gender": "여", "nickname": "마루"}}
 user_profiles = {}
+
+
+def clear_user_profile(user_id: str | None):
+    """인증 완료 후 해당 유저의 임시 프로필 정보를 폐기"""
+    if user_id and user_id in user_profiles:
+        del user_profiles[user_id]
 
 
 def to_superscript(text: str) -> str:
@@ -342,96 +348,3 @@ def reply_messages(reply_token: str, texts: list[str]):
             ReplyMessageRequest(
                 reply_token=reply_token,
                 messages=messages,
-            )
-        )
-
-
-@app.route("/", methods=["GET"])
-def health_check():
-    return "VELVET HOUR Auth Bot is running.", 200
-
-
-@app.route("/callback", methods=["POST"])
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-
-    return "OK"
-
-
-@handler.add(MemberJoinedEvent)
-def handle_member_joined(event):
-    reply_messages(event.reply_token, [MSG_1])
-
-
-@handler.add(MessageEvent, message=AudioMessageContent)
-def handle_audio_message(event):
-    user_id = getattr(event.source, "user_id", None)
-    profile = user_profiles.get(user_id) if user_id else None
-
-    try:
-        audio_bytes = download_line_audio(event.message.id)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wav_path = convert_m4a_to_wav_16k_mono(audio_bytes, tmpdir)
-            voice_info = analyze_voice_features(wav_path)
-            transcript = transcribe_korean_speech(wav_path)
-    except Exception:
-        reply_messages(event.reply_token, [MSG_4])
-        return
-
-    if not voice_info.get("ok"):
-        reply_messages(event.reply_token, [MSG_4])
-        return
-
-    est_gender = voice_info["gender"]
-    expected_gender = profile["gender"] if profile else None
-    expected_nick = profile["nickname"] if profile else None
-
-    gender_ok = expected_gender is None or est_gender == expected_gender
-    script_ok = verify_spoken_script(transcript, expected_nick)
-
-    if gender_ok and script_ok:
-        outputs = [MSG_3]
-        if profile:
-            outputs.append(build_nickname(profile["nickname"], profile["gender"], profile["year2"]))
-        reply_messages(event.reply_token, outputs)
-    else:
-        reply_messages(event.reply_token, [MSG_4])
-
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    user_text = event.message.text.strip()
-    user_id = getattr(event.source, "user_id", None)
-
-    if user_text in MANUAL_REPLIES:
-        outputs = [MANUAL_REPLIES[user_text]]
-        if user_text == "/3" and user_id and user_id in user_profiles:
-            p = user_profiles[user_id]
-            outputs.append(build_nickname(p["nickname"], p["gender"], p["year2"]))
-        reply_messages(event.reply_token, outputs)
-        return
-
-    parsed = parse_step1_form(user_text)
-    if parsed:
-        if user_id:
-            user_profiles[user_id] = parsed
-        reply_messages(event.reply_token, [MSG_2])
-        return
-
-    parts = user_text.split()
-    if len(parts) == 3:
-        nick, gender, raw_year = parts
-        year2 = normalize_year2(raw_year)
-        if is_valid_hangul_two_chars(nick) and gender in GENDER_EMOJI_MAP and year2:
-            reply_messages(event.reply_token, [build_nickname(nick, gender, year2)])
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
