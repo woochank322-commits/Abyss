@@ -1,16 +1,16 @@
 from difflib import SequenceMatcher
+import json
 import logging
 import os
 import re
 import subprocess
 import tempfile
 from datetime import datetime
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from flask import Flask, request, abort
-import numpy as np
-from scipy.io import wavfile
 import speech_recognition as sr
 
 from linebot.v3 import WebhookHandler
@@ -48,12 +48,11 @@ handler = WebhookHandler(CHANNEL_SECRET)
 KST = ZoneInfo("Asia/Seoul")
 # 현재 시각 검증 시 분(minute) 허용 오차 (0이면 정확히 일치, 1이면 ±1분 허용)
 ALLOWED_MINUTE_DIFF = 1
-# 여성 판정 최소 피치 하한선 (조용히 말하는 발화까지 고려해 95Hz로 하향)
-FEMALE_MIN_PITCH_HZ = 95.0
-# 남성 판정 피치 상한선
-MALE_MAX_PITCH_HZ = 170.0
 # STT 닉네임 유사도 허용 기준 (0.0~1.0, 부분 문자열 포함 시에는 무조건 통과)
 NICKNAME_SIMILARITY_THRESHOLD = 0.65
+
+PROFILE_STORE_PATH = "/tmp/velvet_user_profiles.json"
+profile_lock = Lock()
 
 MSG_1 = (
     "📋─ 인증전 간단소개 ─ 📋\n"
@@ -108,14 +107,54 @@ GENDER_EMOJI_MAP = {
 
 SUPERSCRIPT_MAP = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
-# 유저별 임시 인증 정보 저장: {user_id: {"year2": "09", "gender": "여", "nickname": "마루"}}
-user_profiles = {}
+
+def load_profiles() -> dict:
+    if not os.path.exists(PROFILE_STORE_PATH):
+        return {}
+    try:
+        with open(PROFILE_STORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_profiles(profiles: dict):
+    try:
+        with open(PROFILE_STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(profiles, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("[PROFILE] failed to persist profiles: %s", e)
+
+
+user_profiles = load_profiles()
+
+
+def set_user_profile(user_id: str, profile: dict):
+    with profile_lock:
+        user_profiles[user_id] = profile
+        save_profiles(user_profiles)
+
+
+def get_user_profile(user_id: str | None) -> dict | None:
+    if not user_id:
+        return None
+    with profile_lock:
+        if user_id in user_profiles:
+            return user_profiles[user_id]
+        latest = load_profiles()
+        user_profiles.update(latest)
+        return user_profiles.get(user_id)
 
 
 def clear_user_profile(user_id: str | None):
     """인증 완료 후 해당 유저의 임시 프로필 정보를 폐기"""
-    if user_id and user_id in user_profiles:
-        del user_profiles[user_id]
+    if not user_id:
+        return
+    with profile_lock:
+        if user_id in user_profiles:
+            del user_profiles[user_id]
+            save_profiles(user_profiles)
 
 
 def to_superscript(text: str) -> str:
@@ -221,112 +260,6 @@ def convert_m4a_to_wav_16k_mono(audio_bytes: bytes, tmpdir: str) -> str:
     return wav_path
 
 
-def compute_spectral_centroid(frame: np.ndarray, sample_rate: int) -> float:
-    """단일 프레임의 스펙트럼 중심(Spectral Centroid, Hz) 계산"""
-    n = len(frame)
-    if n < 2:
-        return 0.0
-    windowed = frame * np.hanning(n)
-    spectrum = np.abs(np.fft.rfft(windowed))
-    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
-
-    band_mask = (freqs >= 80.0) & (freqs <= 6000.0)
-    band_mag = spectrum[band_mask]
-    band_freqs = freqs[band_mask]
-
-    total_mag = float(np.sum(band_mag))
-    if total_mag <= 1e-9:
-        return 0.0
-    return float(np.sum(band_freqs * band_mag) / total_mag)
-
-
-def analyze_voice_features(wav_path: str) -> dict:
-    """녹음 길이, 유성음 비율, 피치 중앙값(Hz), 스펙트럼 중심 중앙값(Hz) 측정"""
-    sample_rate, samples = wavfile.read(wav_path)
-    if samples.size == 0 or sample_rate <= 0:
-        return {"ok": False}
-
-    duration_sec = float(len(samples)) / float(sample_rate)
-    if duration_sec < 1.0:
-        return {"ok": False, "reason": "short_audio"}
-
-    audio = samples.astype(np.float32)
-    max_val = float(np.max(np.abs(audio)))
-    if max_val > 0:
-        audio = audio / max_val
-
-    frame_len = int(sample_rate * 0.03)
-    hop_len = int(sample_rate * 0.015)
-    min_lag = max(1, int(sample_rate / 350))
-    max_lag = min(frame_len - 1, int(sample_rate / 70))
-
-    total_frames = 0
-    voiced_frames = 0
-    pitches = []
-    centroids = []
-
-    for start in range(0, len(audio) - frame_len, hop_len):
-        total_frames += 1
-        frame = audio[start : start + frame_len]
-        rms = float(np.sqrt(np.mean(frame ** 2)))
-        if rms < 0.012:
-            continue
-
-        windowed = frame * np.hanning(frame_len)
-        corr = np.correlate(windowed, windowed, mode="full")[frame_len - 1 :]
-        if corr[0] <= 0:
-            continue
-
-        region = corr[min_lag : max_lag + 1]
-        if region.size == 0:
-            continue
-
-        best_idx = int(np.argmax(region))
-        best_lag = min_lag + best_idx
-        peak_ratio = float(region[best_idx] / corr[0])
-
-        if peak_ratio > 0.28 and best_lag > 0:
-            freq = float(sample_rate / best_lag)
-            if 75.0 <= freq <= 350.0:
-                voiced_frames += 1
-                pitches.append(freq)
-                sc = compute_spectral_centroid(frame, sample_rate)
-                if sc > 0:
-                    centroids.append(sc)
-
-    voiced_ratio = (voiced_frames / total_frames) if total_frames > 0 else 0.0
-    if voiced_ratio < 0.12 or not pitches:
-        return {"ok": False, "reason": "low_voiced_ratio"}
-
-    median_pitch = float(np.median(pitches))
-    median_centroid = float(np.median(centroids)) if centroids else 0.0
-
-    # 프로필이 없을 때 기본 참고용 성별
-    default_gender = "남" if median_pitch < MALE_MAX_PITCH_HZ else "여"
-
-    return {
-        "ok": True,
-        "gender": default_gender,
-        "duration_sec": round(duration_sec, 2),
-        "voiced_ratio": round(voiced_ratio * 100, 1),
-        "pitch_hz": round(median_pitch, 1),
-        "centroid_hz": round(median_centroid, 1),
-    }
-
-
-def verify_gender_match(expected_gender: str | None, voice_info: dict) -> tuple[bool, str]:
-    """양식 성별과 음성 분석 결과 비교 (조용한 발화 반영해 여성 최소 피치 하한선 하향)"""
-    pitch_hz = float(voice_info.get("pitch_hz", 0.0))
-    est_gender = "남" if pitch_hz < MALE_MAX_PITCH_HZ else "여"
-
-    if expected_gender is None:
-        return True, est_gender
-    if expected_gender == "여":
-        matched = pitch_hz >= FEMALE_MIN_PITCH_HZ
-        return matched, ("여" if matched else "남")
-    return (pitch_hz < MALE_MAX_PITCH_HZ), est_gender
-
-
 def transcribe_korean_speech(wav_path: str) -> str | None:
     recognizer = sr.Recognizer()
     with sr.AudioFile(wav_path) as source:
@@ -338,7 +271,6 @@ def transcribe_korean_speech(wav_path: str) -> str | None:
 
 
 def korean_number_to_int(word: str) -> int | None:
-    """'열한', '십칠', '이십오', '반' 등 한국어 수사를 정수로 변환"""
     word = word.strip()
     if not word:
         return None
@@ -375,7 +307,6 @@ def korean_number_to_int(word: str) -> int | None:
 
 
 def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
-    """음성 인식 텍스트에서 발화된 (시_24h_후보들, 분) 목록을 추출"""
     compact = re.sub(r"\s+", "", text)
     if not compact:
         return []
@@ -422,7 +353,6 @@ def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
 
 
 def verify_current_kst_time(transcript: str | None, now_kst: datetime) -> bool:
-    """현재 한국 시간(KST)과 말한 시각(시/분)이 일치하는지 검증"""
     if not transcript:
         return False
 
@@ -445,7 +375,6 @@ def verify_current_kst_time(transcript: str | None, now_kst: datetime) -> bool:
 
 
 def matches_nickname_flexible(compact_transcript: str, expected_nickname: str) -> bool:
-    """닉네임 포함 여부 또는 STT 오인식(예: 마루 -> 마을) 유사도 검증"""
     if expected_nickname in compact_transcript:
         return True
 
@@ -464,7 +393,6 @@ def matches_nickname_flexible(compact_transcript: str, expected_nickname: str) -
 
 
 def verify_spoken_script(transcript: str | None, expected_nickname: str | None, now_kst: datetime) -> bool:
-    """현재 KST 시간과 닉네임을 함께 말했는지 검증"""
     if not transcript:
         return False
 
@@ -525,57 +453,39 @@ def handle_member_joined(event):
 @handler.add(MessageEvent, message=AudioMessageContent)
 def handle_audio_message(event):
     user_id = getattr(event.source, "user_id", None)
-    profile = user_profiles.get(user_id) if user_id else None
+    profile = get_user_profile(user_id)
     now_kst = datetime.now(KST)
+
+    if not profile:
+        logger.info("[VOICE] missing profile user_id=%s", user_id)
+        reply_messages(event.reply_token, [MSG_1])
+        return
 
     try:
         audio_bytes = download_line_audio(event.message.id)
         with tempfile.TemporaryDirectory() as tmpdir:
             wav_path = convert_m4a_to_wav_16k_mono(audio_bytes, tmpdir)
-            voice_info = analyze_voice_features(wav_path)
             transcript = transcribe_korean_speech(wav_path)
     except Exception:
         logger.exception("[VOICE] audio processing error user_id=%s", user_id)
         reply_messages(event.reply_token, [MSG_4])
         return
 
-    if not voice_info.get("ok"):
-        logger.info(
-            "[VOICE] rejected user_id=%s reason=%s transcript=%r",
-            user_id,
-            voice_info.get("reason"),
-            transcript,
-        )
-        reply_messages(event.reply_token, [MSG_4])
-        return
-
-    expected_gender = profile["gender"] if profile else None
-    expected_nick = profile["nickname"] if profile else None
-
-    gender_ok, est_gender = verify_gender_match(expected_gender, voice_info)
+    expected_nick = profile["nickname"]
     script_ok = verify_spoken_script(transcript, expected_nick, now_kst)
 
     logger.info(
-        "[VOICE] user_id=%s kst=%s est_gender=%s expected_gender=%s gender_ok=%s script_ok=%s "
-        "pitch=%sHz centroid=%sHz voiced=%s%% transcript=%r profile=%s",
+        "[VOICE] user_id=%s kst=%s script_ok=%s transcript=%r profile=%s",
         user_id,
         now_kst.strftime("%Y-%m-%d %H:%M:%S"),
-        est_gender,
-        expected_gender,
-        gender_ok,
         script_ok,
-        voice_info.get("pitch_hz"),
-        voice_info.get("centroid_hz"),
-        voice_info.get("voiced_ratio"),
         transcript,
         profile,
     )
 
-    if gender_ok and script_ok:
-        outputs = [MSG_3]
-        if profile:
-            outputs.append(build_nickname(profile["nickname"], profile["gender"], profile["year2"]))
-        reply_messages(event.reply_token, outputs)
+    if script_ok:
+        nickname_str = build_nickname(profile["nickname"], profile["gender"], profile["year2"])
+        reply_messages(event.reply_token, [MSG_3, nickname_str])
         clear_user_profile(user_id)
     else:
         reply_messages(event.reply_token, [MSG_4])
@@ -588,21 +498,25 @@ def handle_message(event):
 
     if user_text in MANUAL_REPLIES:
         outputs = [MANUAL_REPLIES[user_text]]
-        if user_text == "/3" and user_id and user_id in user_profiles:
-            p = user_profiles[user_id]
-            outputs.append(build_nickname(p["nickname"], p["gender"], p["year2"]))
-            clear_user_profile(user_id)
+        if user_text == "/3":
+            p = get_user_profile(user_id)
+            if p:
+                outputs.append(build_nickname(p["nickname"], p["gender"], p["year2"]))
+                clear_user_profile(user_id)
         reply_messages(event.reply_token, outputs)
         return
 
     parsed = parse_step1_form(user_text)
     if parsed:
         if user_id:
-            user_profiles[user_id] = parsed
+            set_user_profile(user_id, parsed)
+            logger.info("[PROFILE] saved user_id=%s profile=%s", user_id, parsed)
+        else:
+            logger.warning("[PROFILE] parsed form without user_id: %s", parsed)
         reply_messages(event.reply_token, [MSG_2])
         return
 
-    parts = user_text.split()
+    parts = [p for p in re.split(r"[\s/]+", user_text) if p]
     if len(parts) == 3:
         nick, gender, raw_year = parts
         year2 = normalize_year2(raw_year)
