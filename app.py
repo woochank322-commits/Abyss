@@ -48,8 +48,10 @@ handler = WebhookHandler(CHANNEL_SECRET)
 KST = ZoneInfo("Asia/Seoul")
 # 현재 시각 검증 시 분(minute) 허용 오차 (0이면 정확히 일치, 1이면 ±1분 허용)
 ALLOWED_MINUTE_DIFF = 1
-# 여성 기본 주파수(Hz) 판정 기준 (로그 기준 여성 ~216~219Hz, 남성 ~100Hz)
-FEMALE_PITCH_THRESHOLD_HZ = 170.0
+# 여성 판정 최소 피치 하한선 (조용히 말하는 발화까지 고려해 95Hz로 하향)
+FEMALE_MIN_PITCH_HZ = 95.0
+# 남성 판정 피치 상한선
+MALE_MAX_PITCH_HZ = 170.0
 # STT 닉네임 유사도 허용 기준 (0.0~1.0, 부분 문자열 포함 시에는 무조건 통과)
 NICKNAME_SIMILARITY_THRESHOLD = 0.65
 
@@ -239,7 +241,7 @@ def compute_spectral_centroid(frame: np.ndarray, sample_rate: int) -> float:
 
 
 def analyze_voice_features(wav_path: str) -> dict:
-    """녹음 길이, 유성음 비율, 피치 중앙값(Hz), 스펙트럼 중심 중앙값(Hz) 및 성별 추정"""
+    """녹음 길이, 유성음 비율, 피치 중앙값(Hz), 스펙트럼 중심 중앙값(Hz) 측정"""
     sample_rate, samples = wavfile.read(wav_path)
     if samples.size == 0 or sample_rate <= 0:
         return {"ok": False}
@@ -267,7 +269,7 @@ def analyze_voice_features(wav_path: str) -> dict:
         total_frames += 1
         frame = audio[start : start + frame_len]
         rms = float(np.sqrt(np.mean(frame ** 2)))
-        if rms < 0.025:
+        if rms < 0.012:
             continue
 
         windowed = frame * np.hanning(frame_len)
@@ -283,7 +285,7 @@ def analyze_voice_features(wav_path: str) -> dict:
         best_lag = min_lag + best_idx
         peak_ratio = float(region[best_idx] / corr[0])
 
-        if peak_ratio > 0.35 and best_lag > 0:
+        if peak_ratio > 0.28 and best_lag > 0:
             freq = float(sample_rate / best_lag)
             if 75.0 <= freq <= 350.0:
                 voiced_frames += 1
@@ -293,23 +295,36 @@ def analyze_voice_features(wav_path: str) -> dict:
                     centroids.append(sc)
 
     voiced_ratio = (voiced_frames / total_frames) if total_frames > 0 else 0.0
-    if voiced_ratio < 0.15 or not pitches:
+    if voiced_ratio < 0.12 or not pitches:
         return {"ok": False, "reason": "low_voiced_ratio"}
 
     median_pitch = float(np.median(pitches))
     median_centroid = float(np.median(centroids)) if centroids else 0.0
 
-    # 실제 측정 로그 기준: 여성 ~216~219Hz, 남성 ~100Hz
-    est_gender = "여" if median_pitch >= FEMALE_PITCH_THRESHOLD_HZ else "남"
+    # 프로필이 없을 때 기본 참고용 성별
+    default_gender = "남" if median_pitch < MALE_MAX_PITCH_HZ else "여"
 
     return {
         "ok": True,
-        "gender": est_gender,
+        "gender": default_gender,
         "duration_sec": round(duration_sec, 2),
         "voiced_ratio": round(voiced_ratio * 100, 1),
         "pitch_hz": round(median_pitch, 1),
         "centroid_hz": round(median_centroid, 1),
     }
+
+
+def verify_gender_match(expected_gender: str | None, voice_info: dict) -> tuple[bool, str]:
+    """양식 성별과 음성 분석 결과 비교 (조용한 발화 반영해 여성 최소 피치 하한선 하향)"""
+    pitch_hz = float(voice_info.get("pitch_hz", 0.0))
+    est_gender = "남" if pitch_hz < MALE_MAX_PITCH_HZ else "여"
+
+    if expected_gender is None:
+        return True, est_gender
+    if expected_gender == "여":
+        matched = pitch_hz >= FEMALE_MIN_PITCH_HZ
+        return matched, ("여" if matched else "남")
+    return (pitch_hz < MALE_MAX_PITCH_HZ), est_gender
 
 
 def transcribe_korean_speech(wav_path: str) -> str | None:
@@ -534,11 +549,10 @@ def handle_audio_message(event):
         reply_messages(event.reply_token, [MSG_4])
         return
 
-    est_gender = voice_info["gender"]
     expected_gender = profile["gender"] if profile else None
     expected_nick = profile["nickname"] if profile else None
 
-    gender_ok = expected_gender is None or est_gender == expected_gender
+    gender_ok, est_gender = verify_gender_match(expected_gender, voice_info)
     script_ok = verify_spoken_script(transcript, expected_nick, now_kst)
 
     logger.info(
