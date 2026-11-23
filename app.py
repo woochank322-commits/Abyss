@@ -239,7 +239,6 @@ def convert_m4a_to_wav_16k_mono(audio_bytes: bytes, tmpdir: str) -> str:
     with open(in_path, "wb") as f:
         f.write(audio_bytes)
 
-    # 조용한 발화 인식을 위해 볼륨을 소폭 부스팅(2.5x)하여 16kHz 모노 WAV로 변환
     subprocess.run(
         [
             "ffmpeg",
@@ -490,11 +489,6 @@ def handle_audio_message(event):
         bool(profile),
     )
 
-    if not profile:
-        logger.info("[VOICE] missing profile user_id=%s", user_id)
-        reply_messages(event.reply_token, [MSG_1])
-        return
-
     try:
         audio_bytes = download_line_audio(event.message.id)
         logger.info("[VOICE] downloaded bytes=%d user_id=%s", len(audio_bytes), user_id)
@@ -506,7 +500,7 @@ def handle_audio_message(event):
         reply_messages(event.reply_token, [MSG_4])
         return
 
-    expected_nick = profile["nickname"]
+    expected_nick = profile["nickname"] if profile else None
     spoken_pairs = extract_spoken_hour_minute(transcript or "")
     script_ok = verify_spoken_script(transcript, expected_nick, now_kst)
 
@@ -521,9 +515,11 @@ def handle_audio_message(event):
     )
 
     if script_ok:
-        nickname_str = build_nickname(profile["nickname"], profile["gender"], profile["year2"])
-        reply_messages(event.reply_token, [MSG_3, nickname_str])
-        clear_user_profile(user_id)
+        outputs = [MSG_3]
+        if profile:
+            outputs.append(build_nickname(profile["nickname"], profile["gender"], profile["year2"]))
+            clear_user_profile(user_id)
+        reply_messages(event.reply_token, outputs)
     else:
         reply_messages(event.reply_token, [MSG_4])
 
