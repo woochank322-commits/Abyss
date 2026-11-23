@@ -1,3 +1,4 @@
+from difflib import SequenceMatcher
 import logging
 import os
 import re
@@ -47,6 +48,10 @@ handler = WebhookHandler(CHANNEL_SECRET)
 KST = ZoneInfo("Asia/Seoul")
 # 현재 시각 검증 시 분(minute) 허용 오차 (0이면 정확히 일치, 1이면 ±1분 허용)
 ALLOWED_MINUTE_DIFF = 1
+# 여성 기본 주파수(Hz) 판정 기준 (로그 기준 여성 ~216~219Hz, 남성 ~100Hz)
+FEMALE_PITCH_THRESHOLD_HZ = 170.0
+# STT 닉네임 유사도 허용 기준 (0.0~1.0, 부분 문자열 포함 시에는 무조건 통과)
+NICKNAME_SIMILARITY_THRESHOLD = 0.65
 
 MSG_1 = (
     "📋─ 인증전 간단소개 ─ 📋\n"
@@ -216,9 +221,12 @@ def convert_m4a_to_wav_16k_mono(audio_bytes: bytes, tmpdir: str) -> str:
 
 def compute_spectral_centroid(frame: np.ndarray, sample_rate: int) -> float:
     """단일 프레임의 스펙트럼 중심(Spectral Centroid, Hz) 계산"""
-    windowed = frame * np.hanning(len(frame))
+    n = len(frame)
+    if n < 2:
+        return 0.0
+    windowed = frame * np.hanning(n)
     spectrum = np.abs(np.fft.rfft(windowed))
-    freqs = np.fft.rfftfreq(len(windowed), d=1.0 / sample_rate)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
 
     band_mask = (freqs >= 80.0) & (freqs <= 6000.0)
     band_mag = spectrum[band_mask]
@@ -291,13 +299,8 @@ def analyze_voice_features(wav_path: str) -> dict:
     median_pitch = float(np.median(pitches))
     median_centroid = float(np.median(centroids)) if centroids else 0.0
 
-    # 여성 음성 인식률 개선:
-    # - 피치가 172Hz 이상이면 여성
-    # - 피치가 158Hz 이상이면서 스펙트럼 중심이 1850Hz 이상이면 여성
-    if median_pitch >= 172.0 or (median_pitch >= 158.0 and median_centroid >= 1850.0):
-        est_gender = "여"
-    else:
-        est_gender = "남"
+    # 실제 측정 로그 기준: 여성 ~216~219Hz, 남성 ~100Hz
+    est_gender = "여" if median_pitch >= FEMALE_PITCH_THRESHOLD_HZ else "남"
 
     return {
         "ok": True,
@@ -426,6 +429,25 @@ def verify_current_kst_time(transcript: str | None, now_kst: datetime) -> bool:
     return False
 
 
+def matches_nickname_flexible(compact_transcript: str, expected_nickname: str) -> bool:
+    """닉네임 포함 여부 또는 STT 오인식(예: 마루 -> 마을) 유사도 검증"""
+    if expected_nickname in compact_transcript:
+        return True
+
+    nick_len = len(expected_nickname)
+    if nick_len == 0 or len(compact_transcript) < nick_len:
+        return False
+
+    best_ratio = 0.0
+    for idx in range(len(compact_transcript) - nick_len + 1):
+        chunk = compact_transcript[idx : idx + nick_len]
+        ratio = SequenceMatcher(None, expected_nickname, chunk).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+
+    return best_ratio >= NICKNAME_SIMILARITY_THRESHOLD
+
+
 def verify_spoken_script(transcript: str | None, expected_nickname: str | None, now_kst: datetime) -> bool:
     """현재 KST 시간과 닉네임을 함께 말했는지 검증"""
     if not transcript:
@@ -439,7 +461,7 @@ def verify_spoken_script(transcript: str | None, expected_nickname: str | None, 
         return False
 
     if expected_nickname:
-        return expected_nickname in compact
+        return matches_nickname_flexible(compact, expected_nickname)
 
     return True
 
