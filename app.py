@@ -275,7 +275,7 @@ def analyze_voice_features(wav_path: str) -> dict:
         best_lag = min_lag + best_idx
         peak_ratio = float(region[best_idx] / corr[0])
 
-        if peak_ratio > 0.32 and best_lag > 0:
+        if peak_ratio > 0.35 and best_lag > 0:
             freq = float(sample_rate / best_lag)
             if 75.0 <= freq <= 350.0:
                 voiced_frames += 1
@@ -291,14 +291,13 @@ def analyze_voice_features(wav_path: str) -> dict:
     median_pitch = float(np.median(pitches))
     median_centroid = float(np.median(centroids)) if centroids else 0.0
 
-    # 여성 기본 주파수(보통 165~260Hz)와 남성 기본 주파수(보통 85~165Hz)를 반영한 판별
-    if median_pitch >= 165.0:
+    # 여성 음성 인식률 개선:
+    # - 피치가 172Hz 이상이면 여성
+    # - 피치가 158Hz 이상이면서 스펙트럼 중심이 1850Hz 이상이면 여성
+    if median_pitch >= 172.0 or (median_pitch >= 158.0 and median_centroid >= 1850.0):
         est_gender = "여"
-    elif median_pitch <= 145.0:
-        est_gender = "남"
     else:
-        # 145~165Hz 중간 구간은 스펙트럼 중심(밝기)으로 보완
-        est_gender = "여" if median_centroid >= 1900.0 else "남"
+        est_gender = "남"
 
     return {
         "ok": True,
@@ -503,16 +502,13 @@ def handle_audio_message(event):
         reply_messages(event.reply_token, [MSG_4])
         return
 
-    logger.info(
-        "[VOICE] user_id=%s kst=%s voice_info=%s transcript=%r profile=%s",
-        user_id,
-        now_kst.strftime("%Y-%m-%d %H:%M:%S"),
-        voice_info,
-        transcript,
-        profile,
-    )
-
     if not voice_info.get("ok"):
+        logger.info(
+            "[VOICE] rejected user_id=%s reason=%s transcript=%r",
+            user_id,
+            voice_info.get("reason"),
+            transcript,
+        )
         reply_messages(event.reply_token, [MSG_4])
         return
 
@@ -522,6 +518,22 @@ def handle_audio_message(event):
 
     gender_ok = expected_gender is None or est_gender == expected_gender
     script_ok = verify_spoken_script(transcript, expected_nick, now_kst)
+
+    logger.info(
+        "[VOICE] user_id=%s kst=%s est_gender=%s expected_gender=%s gender_ok=%s script_ok=%s "
+        "pitch=%sHz centroid=%sHz voiced=%s%% transcript=%r profile=%s",
+        user_id,
+        now_kst.strftime("%Y-%m-%d %H:%M:%S"),
+        est_gender,
+        expected_gender,
+        gender_ok,
+        script_ok,
+        voice_info.get("pitch_hz"),
+        voice_info.get("centroid_hz"),
+        voice_info.get("voiced_ratio"),
+        transcript,
+        profile,
+    )
 
     if gender_ok and script_ok:
         outputs = [MSG_3]
