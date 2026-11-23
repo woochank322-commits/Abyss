@@ -1,7 +1,11 @@
+import logging
 import os
 import re
 import subprocess
 import tempfile
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 from flask import Flask, request, abort
 import numpy as np
@@ -27,6 +31,9 @@ from linebot.v3.webhooks import (
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("velvet_auth_bot")
+
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
@@ -36,6 +43,10 @@ if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
 app = Flask(__name__)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
+
+KST = ZoneInfo("Asia/Seoul")
+# 현재 시각 검증 시 분(minute) 허용 오차 (0이면 정확히 일치, 1이면 ±1분 허용)
+ALLOWED_MINUTE_DIFF = 1
 
 MSG_1 = (
     "📋─ 인증전 간단소개 ─ 📋\n"
@@ -248,7 +259,7 @@ def analyze_voice_features(wav_path: str) -> dict:
         total_frames += 1
         frame = audio[start : start + frame_len]
         rms = float(np.sqrt(np.mean(frame ** 2)))
-        if rms < 0.03:
+        if rms < 0.025:
             continue
 
         windowed = frame * np.hanning(frame_len)
@@ -264,9 +275,9 @@ def analyze_voice_features(wav_path: str) -> dict:
         best_lag = min_lag + best_idx
         peak_ratio = float(region[best_idx] / corr[0])
 
-        if peak_ratio > 0.35 and best_lag > 0:
+        if peak_ratio > 0.32 and best_lag > 0:
             freq = float(sample_rate / best_lag)
-            if 70.0 <= freq <= 350.0:
+            if 75.0 <= freq <= 350.0:
                 voiced_frames += 1
                 pitches.append(freq)
                 sc = compute_spectral_centroid(frame, sample_rate)
@@ -280,17 +291,14 @@ def analyze_voice_features(wav_path: str) -> dict:
     median_pitch = float(np.median(pitches))
     median_centroid = float(np.median(centroids)) if centroids else 0.0
 
-    if median_pitch >= 175.0:
+    # 여성 기본 주파수(보통 165~260Hz)와 남성 기본 주파수(보통 85~165Hz)를 반영한 판별
+    if median_pitch >= 165.0:
         est_gender = "여"
-    elif median_pitch < 150.0:
+    elif median_pitch <= 145.0:
         est_gender = "남"
     else:
-        if median_centroid >= 2150.0:
-            est_gender = "여"
-        elif median_centroid < 1650.0:
-            est_gender = "남"
-        else:
-            est_gender = "여" if median_pitch >= 165.0 else "남"
+        # 145~165Hz 중간 구간은 스펙트럼 중심(밝기)으로 보완
+        est_gender = "여" if median_centroid >= 1900.0 else "남"
 
     return {
         "ok": True,
@@ -312,8 +320,115 @@ def transcribe_korean_speech(wav_path: str) -> str | None:
         return None
 
 
-def verify_spoken_script(transcript: str | None, expected_nickname: str | None) -> bool:
-    """실제 현재 시각과 일치할 필요는 없으나, 임의의 시간 표현(시/분)과 닉네임을 말했는지 검증"""
+def korean_number_to_int(word: str) -> int | None:
+    """'열한', '십칠', '이십오', '반' 등 한국어 수사를 정수로 변환"""
+    word = word.strip()
+    if not word:
+        return None
+    if word.isdigit():
+        return int(word)
+    if word == "반":
+        return 30
+
+    hour_map = {
+        "한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6,
+        "일곱": 7, "여덟": 8, "아홉": 9, "열": 10, "열한": 11, "열두": 12,
+        "일": 1, "이": 2, "삼": 3, "사": 4, "오": 5, "육": 6,
+        "칠": 7, "팔": 8, "구": 9, "십": 10, "십일": 11, "십이": 12,
+    }
+    if word in hour_map:
+        return hour_map[word]
+
+    tens_map = {"": 0, "십": 10, "이십": 20, "삼십": 30, "사십": 40, "오십": 50}
+    ones_map = {
+        "": 0, "일": 1, "이": 2, "삼": 3, "사": 4,
+        "오": 5, "육": 6, "칠": 7, "팔": 8, "구": 9,
+    }
+
+    for tens_str, tens_val in tens_map.items():
+        if tens_str and word.startswith(tens_str):
+            rem = word[len(tens_str) :]
+            if rem in ones_map:
+                return tens_val + ones_map[rem]
+
+    if word in ones_map and ones_map[word] > 0:
+        return ones_map[word]
+
+    return None
+
+
+def extract_spoken_hour_minute(text: str) -> list[tuple[int, int]]:
+    """음성 인식 텍스트에서 발화된 (시_24h_후보들, 분) 목록을 추출"""
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return []
+
+    is_pm = "오후" in compact or "저녁" in compact or "밤" in compact
+    is_am = "오전" in compact or "아침" in compact or "새벽" in compact
+
+    hour_matches = re.findall(
+        r"(\d{1,2}|열한|열두|다섯|여섯|일곱|여덟|아홉|열|한|두|세|네|십일|십이|십|일|이|삼|사|오|육|칠|팔|구)\s*시",
+        compact,
+    )
+    minute_matches = re.findall(
+        r"(\d{1,2}|이십|삼십|사십|오십|십|일|이|삼|사|오|육|칠|팔|구|반)\s*분",
+        compact,
+    )
+
+    if not hour_matches:
+        return []
+
+    hours_24_candidates = set()
+    for h_raw in hour_matches:
+        h_val = korean_number_to_int(h_raw)
+        if h_val is None:
+            continue
+        if is_pm and 1 <= h_val <= 11:
+            hours_24_candidates.add(h_val + 12)
+        elif is_am and h_val == 12:
+            hours_24_candidates.add(0)
+        else:
+            hours_24_candidates.add(h_val % 24)
+            if not is_am and not is_pm and 1 <= h_val <= 11:
+                hours_24_candidates.add(h_val + 12)
+
+    minutes = []
+    for m_raw in minute_matches:
+        m_val = korean_number_to_int(m_raw)
+        if m_val is not None and 0 <= m_val <= 59:
+            minutes.append(m_val)
+
+    if not minutes:
+        return []
+
+    return [(h, m) for h in hours_24_candidates for m in minutes]
+
+
+def verify_current_kst_time(transcript: str | None, now_kst: datetime) -> bool:
+    """현재 한국 시간(KST)과 말한 시각(시/분)이 일치하는지 검증"""
+    if not transcript:
+        return False
+
+    spoken_pairs = extract_spoken_hour_minute(transcript)
+    if not spoken_pairs:
+        return False
+
+    cur_hour = now_kst.hour
+    cur_min = now_kst.minute
+
+    for h, m in spoken_pairs:
+        if h != cur_hour:
+            continue
+        diff = abs(m - cur_min)
+        wrapped_diff = min(diff, 60 - diff)
+        if wrapped_diff <= ALLOWED_MINUTE_DIFF:
+            return True
+
+    return False
+
+
+def verify_spoken_script(transcript: str | None, expected_nickname: str | None, now_kst: datetime) -> bool:
+    """현재 KST 시간과 닉네임을 함께 말했는지 검증"""
     if not transcript:
         return False
 
@@ -321,11 +436,7 @@ def verify_spoken_script(transcript: str | None, expected_nickname: str | None) 
     if not compact:
         return False
 
-    time_pattern = re.compile(
-        r"(\d{1,2}시|\d{1,2}분|(한|두|세|네|다섯|여섯|일곱|여덟|아홉|열|열한|열두)시|"
-        r"(일|이|삼|사|오|십|이십|삼십|사십|오십|반)분|오전|오후)"
-    )
-    if not time_pattern.search(compact):
+    if not verify_current_kst_time(transcript, now_kst):
         return False
 
     if expected_nickname:
@@ -379,6 +490,7 @@ def handle_member_joined(event):
 def handle_audio_message(event):
     user_id = getattr(event.source, "user_id", None)
     profile = user_profiles.get(user_id) if user_id else None
+    now_kst = datetime.now(KST)
 
     try:
         audio_bytes = download_line_audio(event.message.id)
@@ -387,8 +499,18 @@ def handle_audio_message(event):
             voice_info = analyze_voice_features(wav_path)
             transcript = transcribe_korean_speech(wav_path)
     except Exception:
+        logger.exception("[VOICE] audio processing error user_id=%s", user_id)
         reply_messages(event.reply_token, [MSG_4])
         return
+
+    logger.info(
+        "[VOICE] user_id=%s kst=%s voice_info=%s transcript=%r profile=%s",
+        user_id,
+        now_kst.strftime("%Y-%m-%d %H:%M:%S"),
+        voice_info,
+        transcript,
+        profile,
+    )
 
     if not voice_info.get("ok"):
         reply_messages(event.reply_token, [MSG_4])
@@ -399,7 +521,7 @@ def handle_audio_message(event):
     expected_nick = profile["nickname"] if profile else None
 
     gender_ok = expected_gender is None or est_gender == expected_gender
-    script_ok = verify_spoken_script(transcript, expected_nick)
+    script_ok = verify_spoken_script(transcript, expected_nick, now_kst)
 
     if gender_ok and script_ok:
         outputs = [MSG_3]
