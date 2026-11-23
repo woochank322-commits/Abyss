@@ -304,3 +304,142 @@ def analyze_voice_features(wav_path: str) -> dict:
 
 def transcribe_korean_speech(wav_path: str) -> str | None:
     recognizer = sr.Recognizer()
+    with sr.AudioFile(wav_path) as source:
+        audio_data = recognizer.record(source)
+    try:
+        return recognizer.recognize_google(audio_data, language="ko-KR")
+    except Exception:
+        return None
+
+
+def verify_spoken_script(transcript: str | None, expected_nickname: str | None) -> bool:
+    """실제 현재 시각과 일치할 필요는 없으나, 임의의 시간 표현(시/분)과 닉네임을 말했는지 검증"""
+    if not transcript:
+        return False
+
+    compact = re.sub(r"\s+", "", transcript)
+    if not compact:
+        return False
+
+    time_pattern = re.compile(
+        r"(\d{1,2}시|\d{1,2}분|(한|두|세|네|다섯|여섯|일곱|여덟|아홉|열|열한|열두)시|"
+        r"(일|이|삼|사|오|십|이십|삼십|사십|오십|반)분|오전|오후)"
+    )
+    if not time_pattern.search(compact):
+        return False
+
+    if expected_nickname:
+        return expected_nickname in compact
+
+    return True
+
+
+def download_line_audio(message_id: str) -> bytes:
+    with ApiClient(configuration) as api_client:
+        blob_api = MessagingApiBlob(api_client)
+        return blob_api.get_message_content(message_id)
+
+
+def reply_messages(reply_token: str, texts: list[str]):
+    messages = [TextMessage(text=t) for t in texts[:5]]
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=messages,
+            )
+        )
+
+
+@app.route("/", methods=["GET"])
+def health_check():
+    return "VELVET HOUR Auth Bot is running.", 200
+
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+
+    return "OK"
+
+
+@handler.add(MemberJoinedEvent)
+def handle_member_joined(event):
+    reply_messages(event.reply_token, [MSG_1])
+
+
+@handler.add(MessageEvent, message=AudioMessageContent)
+def handle_audio_message(event):
+    user_id = getattr(event.source, "user_id", None)
+    profile = user_profiles.get(user_id) if user_id else None
+
+    try:
+        audio_bytes = download_line_audio(event.message.id)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = convert_m4a_to_wav_16k_mono(audio_bytes, tmpdir)
+            voice_info = analyze_voice_features(wav_path)
+            transcript = transcribe_korean_speech(wav_path)
+    except Exception:
+        reply_messages(event.reply_token, [MSG_4])
+        return
+
+    if not voice_info.get("ok"):
+        reply_messages(event.reply_token, [MSG_4])
+        return
+
+    est_gender = voice_info["gender"]
+    expected_gender = profile["gender"] if profile else None
+    expected_nick = profile["nickname"] if profile else None
+
+    gender_ok = expected_gender is None or est_gender == expected_gender
+    script_ok = verify_spoken_script(transcript, expected_nick)
+
+    if gender_ok and script_ok:
+        outputs = [MSG_3]
+        if profile:
+            outputs.append(build_nickname(profile["nickname"], profile["gender"], profile["year2"]))
+        reply_messages(event.reply_token, outputs)
+        clear_user_profile(user_id)
+    else:
+        reply_messages(event.reply_token, [MSG_4])
+
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    user_text = event.message.text.strip()
+    user_id = getattr(event.source, "user_id", None)
+
+    if user_text in MANUAL_REPLIES:
+        outputs = [MANUAL_REPLIES[user_text]]
+        if user_text == "/3" and user_id and user_id in user_profiles:
+            p = user_profiles[user_id]
+            outputs.append(build_nickname(p["nickname"], p["gender"], p["year2"]))
+            clear_user_profile(user_id)
+        reply_messages(event.reply_token, outputs)
+        return
+
+    parsed = parse_step1_form(user_text)
+    if parsed:
+        if user_id:
+            user_profiles[user_id] = parsed
+        reply_messages(event.reply_token, [MSG_2])
+        return
+
+    parts = user_text.split()
+    if len(parts) == 3:
+        nick, gender, raw_year = parts
+        year2 = normalize_year2(raw_year)
+        if is_valid_hangul_two_chars(nick) and gender in GENDER_EMOJI_MAP and year2:
+            reply_messages(event.reply_token, [build_nickname(nick, gender, year2)])
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=False)
