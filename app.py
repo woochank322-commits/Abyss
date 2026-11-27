@@ -1,4 +1,3 @@
-from difflib import SequenceMatcher
 import json
 import logging
 import os
@@ -48,8 +47,6 @@ handler = WebhookHandler(CHANNEL_SECRET)
 KST = ZoneInfo("Asia/Seoul")
 # 현재 시각 검증 시 분(minute) 허용 오차 (0이면 정확히 일치, 1이면 ±1분 허용)
 ALLOWED_MINUTE_DIFF = 1
-# STT 닉네임 유사도 허용 기준 (0.0~1.0, 부분 문자열 포함 시에는 무조건 통과)
-NICKNAME_SIMILARITY_THRESHOLD = 0.65
 
 PROFILE_STORE_PATH = "/tmp/velvet_user_profiles.json"
 profile_lock = Lock()
@@ -74,9 +71,9 @@ MSG_2 = (
     "※ 생년월일을 제외한 나머지 개인정보는 꼭!!! 가려주세요.\n\n"
     "   —— 음성 녹음 인증 ——\n\n"
     "🎙️ 음성 녹음으로\n"
-    "**「현재 시간 + 하실 닉네임」**을 말해서 보내주세요!\n\n"
+    "**「현재 시간」**만 정확히 말해서 보내주세요!\n\n"
     "예시)\n"
-    "“오후 7시 52분, 닉네임 ○○입니다.”\n\n"
+    "“오후 7시 52분입니다.”\n\n"
     "토스 먼저 인증 후 음성녹음 부탁드립니다."
 )
 
@@ -400,39 +397,13 @@ def verify_current_kst_time(transcript: str | None, now_kst: datetime) -> bool:
     return False
 
 
-def matches_nickname_flexible(compact_transcript: str, expected_nickname: str) -> bool:
-    if expected_nickname in compact_transcript:
-        return True
-
-    nick_len = len(expected_nickname)
-    if nick_len == 0 or len(compact_transcript) < nick_len:
-        return False
-
-    best_ratio = 0.0
-    for idx in range(len(compact_transcript) - nick_len + 1):
-        chunk = compact_transcript[idx : idx + nick_len]
-        ratio = SequenceMatcher(None, expected_nickname, chunk).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-
-    return best_ratio >= NICKNAME_SIMILARITY_THRESHOLD
-
-
-def verify_spoken_script(transcript: str | None, expected_nickname: str | None, now_kst: datetime) -> bool:
+def verify_spoken_script(transcript: str | None, now_kst: datetime) -> bool:
+    """닉네임 확인 없이 현재 시각 일치 여부만 검증"""
     if not transcript:
         return False
-
-    compact = re.sub(r"\s+", "", transcript)
-    if not compact:
+    if not re.sub(r"\s+", "", transcript):
         return False
-
-    if not verify_current_kst_time(transcript, now_kst):
-        return False
-
-    if expected_nickname:
-        return matches_nickname_flexible(compact, expected_nickname)
-
-    return True
+    return verify_current_kst_time(transcript, now_kst)
 
 
 def download_line_audio(message_id: str) -> bytes:
@@ -500,18 +471,16 @@ def handle_audio_message(event):
         reply_messages(event.reply_token, [MSG_4])
         return
 
-    expected_nick = profile["nickname"] if profile else None
     spoken_pairs = extract_spoken_hour_minute(transcript or "")
-    script_ok = verify_spoken_script(transcript, expected_nick, now_kst)
+    script_ok = verify_spoken_script(transcript, now_kst)
 
     logger.info(
-        "[VOICE] user_id=%s kst=%s parsed_pairs=%s script_ok=%s transcript=%r profile=%s",
+        "[VOICE] user_id=%s kst=%s parsed_pairs=%s script_ok=%s transcript=%r",
         user_id,
         now_kst.strftime("%Y-%m-%d %H:%M:%S"),
         spoken_pairs,
         script_ok,
         transcript,
-        profile,
     )
 
     if script_ok:
@@ -560,3 +529,4 @@ def handle_message(event):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=False)
+ 
