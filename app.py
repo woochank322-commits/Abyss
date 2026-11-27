@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from threading import Lock
 from zoneinfo import ZoneInfo
@@ -36,6 +37,8 @@ logger = logging.getLogger("velvet_auth_bot")
 
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+UPSTASH_REDIS_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or "").strip()
+UPSTASH_REDIS_REST_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or "").strip()
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise ValueError("LINE_CHANNEL_ACCESS_TOKEN과 LINE_CHANNEL_SECRET 환경 변수를 설정해주세요.")
@@ -49,7 +52,18 @@ KST = ZoneInfo("Asia/Seoul")
 ALLOWED_MINUTE_DIFF = 1
 
 PROFILE_STORE_PATH = "/tmp/velvet_user_profiles.json"
+REDIS_PROFILE_KEY = "velvet:auth:profiles"
+FALLBACK_MATCH_WINDOW_SEC = 1800  # 같은 방 내 30분 이내 단독 대기 프로필 폴백 허용
 profile_lock = Lock()
+
+redis_client = None
+if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+    try:
+        from upstash_redis import Redis
+        redis_client = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+        logger.info("[STORAGE] Upstash Redis connected for auth profiles")
+    except Exception as e:
+        logger.warning("[STORAGE] Redis init failed, falling back to /tmp JSON: %s", e)
 
 MSG_1 = (
     "📋─ 인증전 간단소개 ─ 📋\n"
@@ -71,9 +85,9 @@ MSG_2 = (
     "※ 생년월일을 제외한 나머지 개인정보는 꼭!!! 가려주세요.\n\n"
     "   —— 음성 녹음 인증 ——\n\n"
     "🎙️ 음성 녹음으로\n"
-    "**「현재 시간」**만 정확히 말해서 보내주세요!\n\n"
+    "**「현재 시간 + 하실 닉네임」**을 말해서 보내주세요!\n\n"
     "예시)\n"
-    "“오후 7시 52분입니다.”\n\n"
+    "“오후 7시 52분, 닉네임 ○○입니다.”\n\n"
     "토스 먼저 인증 후 음성녹음 부탁드립니다."
 )
 
@@ -106,6 +120,16 @@ SUPERSCRIPT_MAP = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
 def load_profiles() -> dict:
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(REDIS_PROFILE_KEY)
+            if raw:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            logger.warning("[PROFILE] redis load failed: %s", e)
+
     if not os.path.exists(PROFILE_STORE_PATH):
         return {}
     try:
@@ -117,6 +141,12 @@ def load_profiles() -> dict:
 
 
 def save_profiles(profiles: dict):
+    if redis_client is not None:
+        try:
+            redis_client.set(REDIS_PROFILE_KEY, json.dumps(profiles, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("[PROFILE] redis save failed: %s", e)
+
     try:
         with open(PROFILE_STORE_PATH, "w", encoding="utf-8") as f:
             json.dump(profiles, f, ensure_ascii=False)
@@ -127,30 +157,61 @@ def save_profiles(profiles: dict):
 user_profiles = load_profiles()
 
 
-def set_user_profile(user_id: str, profile: dict):
+def set_user_profile(user_id: str | None, chat_id: str | None, profile: dict):
+    now_ts = time.time()
+    enriched = {
+        **profile,
+        "user_id": user_id or "",
+        "chat_id": chat_id or "",
+        "saved_at": now_ts,
+    }
+    key = user_id if user_id else f"anon_{chat_id or 'default'}_{int(now_ts * 1000)}"
     with profile_lock:
-        user_profiles[user_id] = profile
+        latest = load_profiles()
+        user_profiles.clear()
+        user_profiles.update(latest)
+        user_profiles[key] = enriched
         save_profiles(user_profiles)
 
 
-def get_user_profile(user_id: str | None) -> dict | None:
-    if not user_id:
-        return None
+def get_user_profile(user_id: str | None, chat_id: str | None = None) -> tuple[str | None, dict | None]:
+    """
+    1순위: user_id로 정확히 매칭된 프로필 반환
+    2순위: user_id 매칭 실패 시 동일 채팅방(chat_id)에서 최근 30분 내 대기 중인 단일 프로필 폴백
+    """
+    now_ts = time.time()
     with profile_lock:
-        if user_id in user_profiles:
-            return user_profiles[user_id]
         latest = load_profiles()
+        user_profiles.clear()
         user_profiles.update(latest)
-        return user_profiles.get(user_id)
+
+        if user_id and user_id in user_profiles and isinstance(user_profiles[user_id], dict):
+            return user_id, user_profiles[user_id]
+
+        if chat_id:
+            recent_room_profiles = [
+                (k, v)
+                for k, v in user_profiles.items()
+                if isinstance(v, dict)
+                and v.get("chat_id") == chat_id
+                and (now_ts - float(v.get("saved_at", 0))) <= FALLBACK_MATCH_WINDOW_SEC
+            ]
+            if len(recent_room_profiles) == 1:
+                return recent_room_profiles[0]
+
+    return None, None
 
 
-def clear_user_profile(user_id: str | None):
+def clear_user_profile(storage_key: str | None):
     """인증 완료 후 해당 유저의 임시 프로필 정보를 폐기"""
-    if not user_id:
+    if not storage_key:
         return
     with profile_lock:
-        if user_id in user_profiles:
-            del user_profiles[user_id]
+        latest = load_profiles()
+        user_profiles.clear()
+        user_profiles.update(latest)
+        if storage_key in user_profiles:
+            del user_profiles[storage_key]
             save_profiles(user_profiles)
 
 
@@ -164,7 +225,7 @@ def is_valid_hangul_two_chars(nickname: str) -> bool:
 
 def normalize_year2(raw_year: str) -> str | None:
     digits = re.sub(r"[^\d]", "", raw_year)
-    if len(digits) == 4:
+    if len(digits) == 4 and (digits.startswith("19") or digits.startswith("20")):
         return digits[-2:]
     if len(digits) == 2:
         return digits
@@ -176,31 +237,54 @@ def build_nickname(nickname: str, gender: str, year2: str) -> str:
     return f"{nickname}{emoji}{to_superscript(year2)}"
 
 
+def _extract_field_value(line: str) -> str:
+    cleaned = re.sub(r"^[•·\-*\s]+", "", line).strip()
+    if ":" in cleaned:
+        return cleaned.split(":", 1)[1].strip()
+    if "：" in cleaned:
+        return cleaned.split("：", 1)[1].strip()
+    if "-" in cleaned:
+        return cleaned.split("-", 1)[1].strip()
+    return ""
+
+
+def _extract_two_char_hangul_nickname(raw_nick: str) -> str | None:
+    cleaned = raw_nick.strip()
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"\([^)]*\)", " ", cleaned).strip()
+    if is_valid_hangul_two_chars(cleaned):
+        return cleaned
+    for tok in re.split(r"[\s/,|]+", cleaned):
+        tok_clean = re.sub(r"[^가-힣]", "", tok)
+        if is_valid_hangul_two_chars(tok_clean):
+            return tok_clean
+    return None
+
+
 def parse_step1_form(text: str) -> dict | None:
-    """1단계 양식이 작성되었는지 검증하고 년생/성별/닉네임을 추출"""
+    """
+    1단계 양식이 작성되었는지 검증하고 년생/성별/닉네임을 추출.
+    일부 선택 줄이 빠지거나 공백/괄호가 섞여도 핵심 3요소(년생, 성별, 한글 2글자 닉네임)가 있으면 인식.
+    """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    info_line = next((l for l in lines if ("년생" in l or "성별" in l) and (":" in l or "-" in l)), None)
-    nick_line = next((l for l in lines if "닉네임" in l and (":" in l or "-" in l)), None)
-    inviter_line = next((l for l in lines if "초대자" in l and (":" in l or "-" in l)), None)
-    tendency_line = next((l for l in lines if "성향" in l and (":" in l or "-" in l)), None)
-
-    if not all([info_line, nick_line, inviter_line, tendency_line]):
+    if len(lines) < 2:
         return None
 
-    sep = ":" if ":" in info_line else "-"
-    info_val = info_line.split(sep, 1)[1].strip()
+    info_line = next((l for l in lines if ("년생" in l or "성별" in l or "지역" in l)), None)
+    nick_line = next((l for l in lines if "닉네임" in l and "초대자" not in l), None)
 
-    nick_sep = ":" if ":" in nick_line else "-"
-    nick_val = nick_line.split(nick_sep, 1)[1].strip()
+    if not info_line or not nick_line:
+        return None
 
-    inv_sep = ":" if ":" in inviter_line else "-"
-    inviter_val = inviter_line.split(inv_sep, 1)[1].strip()
+    info_val = _extract_field_value(info_line)
+    nick_val_raw = _extract_field_value(nick_line)
 
-    ten_sep = ":" if ":" in tendency_line else "-"
-    tendency_val = tendency_line.split(ten_sep, 1)[1].strip()
+    if not info_val or not nick_val_raw:
+        return None
 
-    if not info_val or not nick_val or not inviter_val or not tendency_val:
+    nickname = _extract_two_char_hangul_nickname(nick_val_raw)
+    if not nickname:
         return None
 
     tokens = [t.strip() for t in re.split(r"[/,|\s]+", info_val) if t.strip()]
@@ -214,18 +298,29 @@ def parse_step1_form(text: str) -> dict | None:
                 year2 = candidate_year
                 continue
         if not gender:
-            if tok == "여" or ("여" in tok and "남" not in tok and "년생" not in tok):
+            tok_hangul = re.sub(r"[^가-힣]", "", tok)
+            if tok_hangul in ("여", "여자", "여성"):
                 gender = "여"
-            elif tok == "남" or ("남" in tok and "여" not in tok and "년생" not in tok):
+            elif tok_hangul in ("남", "남자", "남성"):
                 gender = "남"
 
-    if not year2 or not gender or not is_valid_hangul_two_chars(nick_val):
+    if not year2:
+        m_y = re.search(r"(?:19|20)?(\d{2})\s*년생?", info_val)
+        if m_y:
+            year2 = m_y.group(1)
+    if not gender:
+        if re.search(r"(?:^|[/\s,])여(?:자|성)?(?:$|[/\s,])", info_val):
+            gender = "여"
+        elif re.search(r"(?:^|[/\s,])남(?:자|성)?(?:$|[/\s,])", info_val):
+            gender = "남"
+
+    if not year2 or not gender:
         return None
 
     return {
         "year2": year2,
         "gender": gender,
-        "nickname": nick_val,
+        "nickname": nickname,
     }
 
 
@@ -424,6 +519,16 @@ def reply_messages(reply_token: str, texts: list[str]):
         )
 
 
+def get_chat_id(event) -> str:
+    source = getattr(event, "source", None)
+    return (
+        getattr(source, "group_id", None)
+        or getattr(source, "room_id", None)
+        or getattr(source, "user_id", None)
+        or ""
+    )
+
+
 @app.route("/", methods=["GET"])
 def health_check():
     return "VELVET HOUR Auth Bot is running.", 200
@@ -450,13 +555,15 @@ def handle_member_joined(event):
 @handler.add(MessageEvent, message=AudioMessageContent)
 def handle_audio_message(event):
     user_id = getattr(event.source, "user_id", None)
-    profile = get_user_profile(user_id)
+    chat_id = get_chat_id(event)
+    profile_key, profile = get_user_profile(user_id, chat_id=chat_id)
     now_kst = datetime.now(KST)
 
     logger.info(
-        "[VOICE] received message_id=%s user_id=%s has_profile=%s",
+        "[VOICE] received message_id=%s user_id=%s chat_id=%s has_profile=%s",
         event.message.id,
         user_id,
+        chat_id,
         bool(profile),
     )
 
@@ -475,19 +582,22 @@ def handle_audio_message(event):
     script_ok = verify_spoken_script(transcript, now_kst)
 
     logger.info(
-        "[VOICE] user_id=%s kst=%s parsed_pairs=%s script_ok=%s transcript=%r",
+        "[VOICE] user_id=%s kst=%s parsed_pairs=%s script_ok=%s transcript=%r profile=%s",
         user_id,
         now_kst.strftime("%Y-%m-%d %H:%M:%S"),
         spoken_pairs,
         script_ok,
         transcript,
+        profile,
     )
 
     if script_ok:
         outputs = [MSG_3]
         if profile:
             outputs.append(build_nickname(profile["nickname"], profile["gender"], profile["year2"]))
-            clear_user_profile(user_id)
+            clear_user_profile(profile_key)
+        else:
+            logger.warning("[VOICE] verified but no stored profile for user_id=%s chat_id=%s", user_id, chat_id)
         reply_messages(event.reply_token, outputs)
     else:
         reply_messages(event.reply_token, [MSG_4])
@@ -497,25 +607,30 @@ def handle_audio_message(event):
 def handle_message(event):
     user_text = event.message.text.strip()
     user_id = getattr(event.source, "user_id", None)
+    chat_id = get_chat_id(event)
 
     if user_text in MANUAL_REPLIES:
         outputs = [MANUAL_REPLIES[user_text]]
         if user_text == "/3":
-            p = get_user_profile(user_id)
+            p_key, p = get_user_profile(user_id, chat_id=chat_id)
             if p:
                 outputs.append(build_nickname(p["nickname"], p["gender"], p["year2"]))
-                clear_user_profile(user_id)
+                clear_user_profile(p_key)
         reply_messages(event.reply_token, outputs)
         return
 
     parsed = parse_step1_form(user_text)
     if parsed:
-        if user_id:
-            set_user_profile(user_id, parsed)
-            logger.info("[PROFILE] saved user_id=%s profile=%s", user_id, parsed)
-        else:
-            logger.warning("[PROFILE] parsed form without user_id: %s", parsed)
-        reply_messages(event.reply_token, [MSG_2])
+        set_user_profile(user_id, chat_id, parsed)
+        preview_nick = build_nickname(parsed["nickname"], parsed["gender"], parsed["year2"])
+        logger.info("[PROFILE] saved user_id=%s chat_id=%s profile=%s", user_id, chat_id, parsed)
+        reply_messages(
+            event.reply_token,
+            [
+                MSG_2,
+                f"✅ 간단소개 확인 완료 (예정 닉네임: {preview_nick})",
+            ],
+        )
         return
 
     parts = [p for p in re.split(r"[\s/]+", user_text) if p]
@@ -529,4 +644,3 @@ def handle_message(event):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=False)
- 
