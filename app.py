@@ -262,31 +262,8 @@ def _extract_two_char_hangul_nickname(raw_nick: str) -> str | None:
     return None
 
 
-def parse_step1_form(text: str) -> dict | None:
-    """
-    1단계 양식이 작성되었는지 검증하고 년생/성별/닉네임을 추출.
-    일부 선택 줄이 빠지거나 공백/괄호가 섞여도 핵심 3요소(년생, 성별, 한글 2글자 닉네임)가 있으면 인식.
-    """
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 2:
-        return None
-
-    info_line = next((l for l in lines if ("년생" in l or "성별" in l or "지역" in l)), None)
-    nick_line = next((l for l in lines if "닉네임" in l and "초대자" not in l), None)
-
-    if not info_line or not nick_line:
-        return None
-
-    info_val = _extract_field_value(info_line)
-    nick_val_raw = _extract_field_value(nick_line)
-
-    if not info_val or not nick_val_raw:
-        return None
-
-    nickname = _extract_two_char_hangul_nickname(nick_val_raw)
-    if not nickname:
-        return None
-
+def _parse_year_and_gender(info_val: str) -> tuple[str | None, str | None]:
+    """'08 인천 남', '08/인천/남', '2007 / 서울 / 여' 등에서 2자리 년생과 성별 추출"""
     tokens = [t.strip() for t in re.split(r"[/,|\s]+", info_val) if t.strip()]
     year2 = None
     gender = None
@@ -314,14 +291,59 @@ def parse_step1_form(text: str) -> dict | None:
         elif re.search(r"(?:^|[/\s,])남(?:자|성)?(?:$|[/\s,])", info_val):
             gender = "남"
 
-    if not year2 or not gender:
+    return year2, gender
+
+
+def parse_step1_form(text: str) -> dict | None:
+    """
+    1단계 간단소개 양식 파싱:
+    1) 라벨 포함 형식 ('• 년생 / 지역 / 성별 : ...', '• 사용할 닉네임 : ...')
+    2) 라벨을 모두 지우고 값만 보낸 형식 (예: 08 인천 남 / 인천 / 있음 / 하연 / 디그레이더)
+    """
+    lines = [
+        re.sub(r"^[•·\-*\s]+", "", line).strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+    if len(lines) < 2:
         return None
 
-    return {
-        "year2": year2,
-        "gender": gender,
-        "nickname": nickname,
-    }
+    content_lines = [
+        l for l in lines
+        if "인증전 간단소개" not in l and not re.fullmatch(r"[📋─\-\s]+", l)
+    ]
+    if len(content_lines) < 2:
+        return None
+
+    # 케이스 1: 라벨이 포함된 양식
+    info_line = next((l for l in content_lines if ("년생" in l or "성별" in l or "지역" in l)), None)
+    nick_line = next((l for l in content_lines if "닉네임" in l and "초대자" not in l), None)
+
+    if info_line and nick_line:
+        info_val = _extract_field_value(info_line)
+        nick_val_raw = _extract_field_value(nick_line)
+        if info_val and nick_val_raw:
+            nickname = _extract_two_char_hangul_nickname(nick_val_raw)
+            year2, gender = _parse_year_and_gender(info_val)
+            if year2 and gender and nickname:
+                return {
+                    "year2": year2,
+                    "gender": gender,
+                    "nickname": nickname,
+                }
+
+    # 케이스 2: 라벨 없이 답변 값만 4~6줄로 보낸 양식
+    if 4 <= len(content_lines) <= 6:
+        year2, gender = _parse_year_and_gender(content_lines[0])
+        nickname = _extract_two_char_hangul_nickname(content_lines[1])
+        if year2 and gender and nickname:
+            return {
+                "year2": year2,
+                "gender": gender,
+                "nickname": nickname,
+            }
+
+    return None
 
 
 def convert_m4a_to_wav_16k_mono(audio_bytes: bytes, tmpdir: str) -> str:
